@@ -4,3 +4,6 @@
 backend/*.db
 backend/*.db-journal
 .DS_Store
+.vercel/
+.vercel_build_output/
+
