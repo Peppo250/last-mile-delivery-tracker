@@ -6,7 +6,7 @@
     },
     "backend": {
       "root": "backend",
-      "entrypoint": "src/server.ts"
+      "entrypoint": "api/index.ts"
     }
   },
   "rewrites": [
