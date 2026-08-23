@@ -1,8 +1,0 @@
-{
-  "name": "last-mile-delivery-tracker-root",
-  "private": true,
-  "workspaces": [
-    "frontend",
-    "backend"
-  ]
-}
