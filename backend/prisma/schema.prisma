@@ -1,0 +1,293 @@
+// ============================================================================
+// Last-Mile Delivery Tracker — Database Schema
+// Default datasource is SQLite for zero-config local setup & evaluation.
+// To use PostgreSQL (recommended for production / Render / Railway):
+//   1. set provider = "postgresql" below
+//   2. set DATABASE_URL in .env to a postgres connection string
+// The schema itself is fully Postgres-compatible as written.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite" // change to "postgresql" for production
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// ENUMS
+// ----------------------------------------------------------------------------
+
+enum Role {
+  CUSTOMER
+  AGENT
+  ADMIN
+}
+
+enum OrderType {
+  B2B
+  B2C
+}
+
+enum PaymentType {
+  PREPAID
+  COD
+}
+
+enum ZoneRelation {
+  INTRA
+  INTER
+}
+
+enum SurchargeMode {
+  FLAT
+  PERCENT
+}
+
+enum OrderStatus {
+  PLACED // order created, awaiting agent assignment
+  ASSIGNED // agent assigned, awaiting pickup
+  PICKED_UP
+  IN_TRANSIT
+  OUT_FOR_DELIVERY
+  DELIVERED
+  FAILED
+  RESCHEDULED // customer rescheduled after a failed attempt, awaiting reassignment
+  CANCELLED
+}
+
+enum NotificationChannel {
+  EMAIL
+  SMS
+}
+
+enum NotificationStatus {
+  SENT
+  FAILED
+  SKIPPED
+}
+
+// ----------------------------------------------------------------------------
+// USERS & AGENTS
+// ----------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(uuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  phone        String?
+  role         Role     @default(CUSTOMER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Customer-side relations
+  ordersPlaced    Order[]           @relation("CustomerOrders")
+  ordersCreatedBy Order[]           @relation("AdminCreatedOrders")
+  statusChanges   OrderStatusEvent[] @relation("ActorOfStatusChange")
+  reschedules     Reschedule[]      @relation("RescheduleRequestedBy")
+
+  // Agent-side relation (1:1, only populated when role == AGENT)
+  agentProfile AgentProfile?
+
+  @@index([role])
+}
+
+model AgentProfile {
+  id            String   @id @default(uuid())
+  userId        String   @unique
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // "Home" zone the agent primarily operates in (used for zone-based assignment)
+  zoneId        String?
+  zone          Zone?    @relation(fields: [zoneId], references: [id])
+
+  // Optional live coordinates for nearest-agent assignment
+  currentLat    Float?
+  currentLng    Float?
+
+  isAvailable   Boolean  @default(true)
+  vehicleType   String?
+  updatedAt     DateTime @updatedAt
+
+  ordersAssigned Order[] @relation("AssignedAgent")
+
+  @@index([zoneId, isAvailable])
+}
+
+// ----------------------------------------------------------------------------
+// ZONES, AREAS & RATE CARDS  (admin-configurable, no hardcoded rates)
+// ----------------------------------------------------------------------------
+
+model Zone {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  createdAt DateTime @default(now())
+
+  areas         Area[]
+  agentProfiles AgentProfile[]
+
+  @@index([name])
+}
+
+// An Area is a serviceable locality/pincode mapped to exactly one Zone.
+// Pickup/drop addresses are matched against Areas to detect the order's zones.
+model Area {
+  id      String @id @default(uuid())
+  name    String // e.g. "Velachery" or a pincode label
+  pincode String @unique
+  zoneId  String
+  zone    Zone   @relation(fields: [zoneId], references: [id])
+
+  ordersAsPickup Order[] @relation("PickupArea")
+  ordersAsDrop   Order[] @relation("DropArea")
+
+  @@index([zoneId])
+  @@index([pincode])
+}
+
+// One rate card row = price per (orderType, zoneRelation) pair.
+// e.g. B2C + INTRA, B2C + INTER, B2B + INTRA, B2B + INTER  => 4 rows minimum.
+model RateCard {
+  id           String       @id @default(uuid())
+  orderType    OrderType
+  zoneRelation ZoneRelation
+  baseCharge   Float // flat charge added regardless of weight
+  ratePerKg    Float // charge per billable kg
+  isActive     Boolean      @default(true)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  @@unique([orderType, zoneRelation])
+}
+
+// COD surcharge configured per order type, either a flat fee or a
+// percentage of the computed freight charge.
+model CodSurchargeRule {
+  id        String        @id @default(uuid())
+  orderType OrderType     @unique
+  mode      SurchargeMode
+  value     Float // flat amount OR percentage points (e.g. 2 = 2%)
+  isActive  Boolean       @default(true)
+  updatedAt DateTime      @updatedAt
+}
+
+// ----------------------------------------------------------------------------
+// ORDERS
+// ----------------------------------------------------------------------------
+
+model Order {
+  id             String      @id @default(uuid())
+  orderCode      String      @unique // human-friendly reference, e.g. LMD-000123
+
+  customerId     String
+  customer       User        @relation("CustomerOrders", fields: [customerId], references: [id])
+
+  createdByAdminId String?
+  createdByAdmin    User?   @relation("AdminCreatedOrders", fields: [createdByAdminId], references: [id])
+
+  pickupAddress  String
+  dropAddress    String
+
+  pickupAreaId   String
+  pickupArea     Area        @relation("PickupArea", fields: [pickupAreaId], references: [id])
+  dropAreaId     String
+  dropArea       Area        @relation("DropArea", fields: [dropAreaId], references: [id])
+
+  // package details
+  lengthCm       Float
+  breadthCm      Float
+  heightCm       Float
+  actualWeightKg Float
+  volumetricWeightKg Float
+  billableWeightKg   Float
+
+  orderType      OrderType
+  paymentType    PaymentType
+  zoneRelation   ZoneRelation // INTRA if pickup & drop zone are the same, else INTER
+
+  // computed charge breakdown (all persisted so historical orders are
+  // unaffected by later rate-card changes)
+  baseCharge     Float
+  weightCharge   Float
+  codSurcharge   Float       @default(0)
+  totalCharge    Float
+
+  status         OrderStatus @default(PLACED)
+
+  assignedAgentId String?
+  assignedAgent   AgentProfile? @relation("AssignedAgent", fields: [assignedAgentId], references: [id])
+
+  scheduledDate  DateTime?   // requested/rescheduled delivery date
+  deliveredAt    DateTime?
+
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  statusHistory  OrderStatusEvent[]
+  reschedules    Reschedule[]
+  notifications  NotificationLog[]
+
+  @@index([status])
+  @@index([customerId])
+  @@index([assignedAgentId])
+  @@index([pickupAreaId])
+  @@index([dropAreaId])
+}
+
+// Immutable, append-only audit trail of every status transition.
+// Rows are never updated or deleted — "current status" on Order is a
+// denormalized convenience field derived from the latest event here.
+model OrderStatusEvent {
+  id         String      @id @default(uuid())
+  orderId    String
+  order      Order       @relation(fields: [orderId], references: [id])
+
+  status     OrderStatus
+  note       String?
+
+  actorId    String
+  actor      User        @relation("ActorOfStatusChange", fields: [actorId], references: [id])
+  actorRole  Role
+
+  createdAt  DateTime    @default(now())
+
+  @@index([orderId, createdAt])
+}
+
+// Captures each reschedule request raised after a FAILED delivery attempt.
+model Reschedule {
+  id             String   @id @default(uuid())
+  orderId        String
+  order          Order    @relation(fields: [orderId], references: [id])
+
+  requestedById  String
+  requestedBy    User     @relation("RescheduleRequestedBy", fields: [requestedById], references: [id])
+
+  previousDate   DateTime?
+  newDate        DateTime
+  reason         String?
+  createdAt      DateTime @default(now())
+
+  @@index([orderId])
+}
+
+// Log of every notification attempt (email/SMS), so delivery of
+// notifications is auditable independent of the actual email/SMS provider.
+model NotificationLog {
+  id        String              @id @default(uuid())
+  orderId   String
+  order     Order               @relation(fields: [orderId], references: [id])
+
+  channel   NotificationChannel
+  recipient String
+  subject   String
+  body      String
+  status    NotificationStatus
+  error     String?
+  createdAt DateTime            @default(now())
+
+  @@index([orderId])
+}
